@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install --upgrade pip setuptools
+      - run: pip install -e . pytest pytest-cov parameterized
+      - run: python -m compileall -q tap_pendo
+      # The upstream suite reaches about 83%, so the gate sits at 80%.
+      - run: pytest tests/unittests --cov=tap_pendo --cov-report=term-missing --cov-fail-under=80
