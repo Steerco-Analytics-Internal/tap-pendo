@@ -93,9 +93,9 @@ class TestBookmarks(unittest.TestCase):
 
 
 @mock.patch("tap_pendo.streams.update_currently_syncing")
-@mock.patch("tap_pendo.sync.singer.write_state")
+@mock.patch("singer.write_state")
 @mock.patch("tap_pendo.streams.singer.write_state")
-@mock.patch("tap_pendo.sync.singer.write_record")
+@mock.patch("singer.write_record")
 class TestIncrementalSync(unittest.TestCase):
     def setUp(self):
         for stream_cls in streams.STREAMS.values():
@@ -225,7 +225,7 @@ class FakeFullTableStream:
         return record
 
 
-@mock.patch("tap_pendo.sync.singer.write_record")
+@mock.patch("singer.write_record")
 class TestFullTableSync(unittest.TestCase):
     def test_limited_full_table_stops_at_limit(self, mock_write_record):
         self.assertEqual(sync_full_table({}, FakeFullTableStream([{}, {}, {}], 2)), 2)
