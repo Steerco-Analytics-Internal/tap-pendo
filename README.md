@@ -6,6 +6,23 @@
 
 # tap-pendo
 
+## Steerco's fork
+
+Steerco maintains this fork of [singer-io/tap-pendo](https://github.com/singer-io/tap-pendo)
+to run the tap on Hotglue. It keeps the upstream GPLv3 license and copyright. It changes
+the following:
+
+- The tap accepts `api_key` as another name for `x_pendo_integration_key`. When both are
+  set, `x_pendo_integration_key` wins.
+- `start_date`, `period` and `lookback_window` are optional. They default to 90 days
+  before the run, `dayRange` and 2 days. An explicit value wins.
+- The tap reads `_hg_max_records_limit`, shaped `{"<stream_id>": n}`, for Hotglue Source
+  Samples. A listed stream stops after n records and writes no bookmark. Other streams
+  run unbounded.
+- GitHub Actions runs the unit tests with coverage on Python 3.10 and 3.11.
+
+Stream schemas, primary keys and the other settings match upstream.
+
 This is a [Singer](https://singer.io) tap that produces JSON-formatted data
 following the [Singer
 spec](https://github.com/singer-io/getting-started/blob/master/SPEC.md).
@@ -259,10 +276,11 @@ Interrupted syncs for Event type stream are resumed via a bookmark placed during
 
 3. Create your tap's `config.json` file. The tap config file for this tap should include these entries:
 
-   - `start_date` - the default value to use if no bookmark exists for an endpoint (rfc3339 date string)
-   - `x_pendo_integration_key` (string, `ABCdef123`): an integration key from Pendo.
-   - `period` (string, `ABCdef123`): `dayRange` or `hourRange`
-   - `lookback_window` (integer): 10 (For event objects. Default: 0)
+   - `start_date` - the default value to use if no bookmark exists for an endpoint (rfc3339 date string). Default: 90 days before the run
+   - `x_pendo_integration_key` (string, `ABCdef123`): an integration key from Pendo. The tap also accepts it as `api_key`.
+   - `period` (string, `ABCdef123`): `dayRange` or `hourRange`. Default: `dayRange`
+   - `lookback_window` (integer): 10 (For event objects. Default: 2)
+   - `_hg_max_records_limit` (object, `{"accounts": 100}`): per-stream record limits for Hotglue Source Samples. A listed stream writes no bookmark.
    - `request_timeout` (integer): 300 (For passing timeout to the request. Default: 300)
    - `record_limit` (integer, 100000): maximum number of records Pendo API can retrieve in a single request. Default: 100000 records
    - `app_ids` (string, `8877665523, 1234545`): (comma seperated appIDs. If this parameter is not provided, then the data will be collected from all the apps)

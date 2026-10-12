@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 import singer
 from singer import metadata
@@ -11,7 +12,13 @@ from tap_pendo.discover import discover_streams
 from tap_pendo.streams import STREAMS, SUB_STREAMS, update_currently_syncing
 from tap_pendo.sync import sync_full_table, sync_stream
 
-REQUIRED_CONFIG_KEYS = ["start_date", "x_pendo_integration_key", "period"]
+# The integration key is also required, under either of its names. resolve_config checks it.
+REQUIRED_CONFIG_KEYS = []
+INTEGRATION_KEY = "x_pendo_integration_key"
+INTEGRATION_KEY_ALIAS = "api_key"
+DEFAULT_START_DATE_DAYS = 90
+DEFAULT_LOOKBACK_WINDOW = 2
+DEFAULT_PERIOD = "dayRange"
 
 LOGGER = singer.get_logger()
 
@@ -172,11 +179,35 @@ def filter_app_ids(config):
     return config
 
 
+def is_unset(config, key):
+    # A key is unset when it is missing, null or an empty string
+    return config.get(key) in (None, "")
+
+
+def resolve_config(config):
+    # Accept `api_key` as an alias of `x_pendo_integration_key`. The original key wins when both are set.
+    if is_unset(config, INTEGRATION_KEY) and not is_unset(config, INTEGRATION_KEY_ALIAS):
+        config[INTEGRATION_KEY] = config[INTEGRATION_KEY_ALIAS]
+    if is_unset(config, INTEGRATION_KEY):
+        raise Exception(f"Config is missing required keys: ['{INTEGRATION_KEY}' or '{INTEGRATION_KEY_ALIAS}']")
+
+    # Fill defaults for settings that a connector entry can't compute. An explicit value always wins.
+    if is_unset(config, "start_date"):
+        start_date = datetime.now(timezone.utc) - timedelta(days=DEFAULT_START_DATE_DAYS)
+        config["start_date"] = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if is_unset(config, "lookback_window"):
+        config["lookback_window"] = DEFAULT_LOOKBACK_WINDOW
+    if is_unset(config, "period"):
+        config["period"] = DEFAULT_PERIOD
+    return config
+
+
 @utils.handle_top_exception(LOGGER)
 def main():
 
     # Parse command line arguments
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
+    args.config = resolve_config(args.config)
     args.config = filter_app_ids(args.config)
 
     if args.discover:

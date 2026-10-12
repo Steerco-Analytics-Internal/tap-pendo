@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from itertools import islice
 from datetime import datetime, timedelta, timezone
 from ast import literal_eval
 
@@ -33,6 +34,29 @@ REQUEST_TIMEOUT = 300
 DEFAULT_INCLUDE_ANONYMOUS_VISITORS = 'false'
 
 BACKOFF_FACTOR = 5
+
+# Hotglue passes per-stream record limits for Source Samples, shaped {"<stream_id>": n}
+MAX_RECORDS_LIMIT_KEY = "_hg_max_records_limit"
+
+
+def get_max_records(config, stream_name):
+    """
+        Return the record limit for the stream, or None when the stream runs unbounded.
+        A limited stream stops after n records and writes no bookmarks.
+    """
+    limits = (config or {}).get(MAX_RECORDS_LIMIT_KEY) or {}
+    if isinstance(limits, str):
+        limits = json.loads(limits)
+    if limits.get(stream_name) is None:
+        return None
+    max_records = int(limits[stream_name])
+    if max_records < 0:
+        raise ValueError(f"Invalid {MAX_RECORDS_LIMIT_KEY} value for {stream_name}: {max_records}")
+    return max_records
+
+
+def is_limit_reached(count, max_records):
+    return max_records is not None and count >= max_records
 
 def to_giveup(error):
     """
@@ -154,6 +178,7 @@ class Stream():
 
     def __init__(self, config=None):
         self.config = config
+        self.max_records = get_max_records(config, self.name)
         self.record_limit = self.get_default_record_limit()
         self.empty_replication_key_records = []
 
@@ -171,9 +196,14 @@ class Stream():
         try:
             # Defualt record limit will be set for None and Whitespaces
             # Whitespaces before and after will be trimmed around valid numeric strings
-            return int(literal_eval(record_limit) if record_limit.strip() else API_RECORD_LIMIT)
+            page_limit = int(literal_eval(record_limit) if record_limit.strip() else API_RECORD_LIMIT)
         except (NameError, SyntaxError, ValueError) as e:
             raise ValueError("Invalid numeric value: " + str(self.config.get('record_limit'))) from e
+        # A limited stream never needs a page larger than the records it emits
+        max_records = getattr(self, 'max_records', None)
+        if max_records is not None:
+            page_limit = min(page_limit, max(max_records, 1))
+        return page_limit
 
     def send_request_get_results(self, req, endpoint, params, count, **kwargs):
         # Increament timeout duration based on retry attempt
@@ -251,8 +281,8 @@ class Stream():
         # Return default value if no bookmark present in state for provided stream
         if (state is None) or ('bookmarks' not in state):
             return default
-        # Initialize bookmark if not present
-        if not state.get('bookmarks').get(stream):
+        # Initialize bookmark if not present. A limited stream leaves the state untouched.
+        if not state.get('bookmarks').get(stream) and get_max_records(self.config, stream) is None:
             state['bookmarks'][stream] = {}
         # Look for bookmark with key for stream
         if key:
@@ -268,6 +298,9 @@ class Stream():
         # NOTE: Bookmarking can never be updated to not get the most
         # recent thing it saw the next time you run, because the querying
         # only allows greater than or equal semantics.
+        # A limited stream is a sample, so it never moves its bookmark.
+        if get_max_records(self.config, stream) is not None:
+            return
         singer.write_bookmark(
             state,
             # name is overridden by some substreams
@@ -442,8 +475,13 @@ class Stream():
                             sub_stream.key_properties)
 
         last_processed_key = parent.key_properties[0] if isinstance(parent, Visitors) else humps.decamelize(self.replication_key)
+        # A limited child stream stops reading parents once it has emitted its records
+        child_max_records = get_max_records(self.config, sub_stream.name)
+        child_record_count = 0
         # Loop over records of parent stream
         for record in parent_response:
+            if is_limit_reached(child_record_count, child_max_records):
+                break
             try:
                 try:
                     if last_processed and record.get(last_processed_key) < last_processed:
@@ -491,7 +529,7 @@ class Stream():
                         # During historical syncs, child streams may have large amount of records which may lead to OOM issues
                         # To avoid that we will spit-out records in batches into the target
                         loop_for_records = True
-                        while loop_for_records:
+                        while loop_for_records and not is_limit_reached(child_record_count, child_max_records):
                             # syncing child streams from start date or state file date
                             if isinstance(parent, Visitors):
                                 stream_events = sub_stream.sync(state, bookmark_dttm,
@@ -505,6 +543,8 @@ class Stream():
 
                             # Loop over data of sub-stream
                             for event in stream_events:
+                                if is_limit_reached(child_record_count, child_max_records):
+                                    break
 
                                 # Get metadata for the stream to use in transform
                                 schema_dict = sub_stream.stream.schema.to_dict()
@@ -542,6 +582,7 @@ class Stream():
                                     new_bookmark = max(new_bookmark, event_time)
 
                                 counter.increment()
+                                child_record_count += 1
                                 singer.write_record(sub_stream.stream.tap_stream_id,
                                                     transformed_record)
 
@@ -560,7 +601,7 @@ class Stream():
                     sub_stream.name, record[last_processed_key])
 
         # After processing for all parent ids we can remove our resumption state
-        if 'last_processed' in state.get('bookmarks').get(sub_stream.name):
+        if child_max_records is None and 'last_processed' in state.get('bookmarks').get(sub_stream.name):
             state.get('bookmarks').get(sub_stream.name).pop('last_processed')
 
         self.update_child_stream_bookmarks(state=state,
@@ -726,8 +767,10 @@ class Stream():
             self.empty_replication_key_records = []
 
         # Sync substream if the current stream has sub-stream and selected in the catalog
+        # A limited parent syncs children only for the parent records it can emit
         if stream_records and sub_stream and sub_stream.is_selected():
-            self.sync_substream(state, self, sub_stream, stream_records)
+            parent_records = stream_records if self.max_records is None else stream_records[:self.max_records]
+            self.sync_substream(state, self, sub_stream, parent_records)
 
         update_currently_syncing(state, None)
         return (self.stream, stream_records), loop_for_records
@@ -837,8 +880,10 @@ class LazyAggregationStream(Stream):
             sub_stream = None
 
         # Sync substream if the current stream has sub-stream and selected in the catalog
+        # A limited parent syncs children only for the parent records it can emit
         if stream_response and sub_stream and sub_stream.is_selected():
-            self.sync_substream(state, self, sub_stream, stream_response)
+            parent_records = stream_response if self.max_records is None else islice(stream_response, self.max_records)
+            self.sync_substream(state, self, sub_stream, parent_records)
 
             # Get parent data again as stream_response returned from request() is a generator
             # which flush out during sync_substream call above

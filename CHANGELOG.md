@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0 (Steerco fork)
+  * Accept `api_key` as an alias of `x_pendo_integration_key`.
+  * Default `start_date` to 90 days before the run, `period` to `dayRange` and `lookback_window` to 2 days.
+  * Read `_hg_max_records_limit` for Hotglue Source Samples. A limited stream stops at its limit and writes no bookmark.
+  * Run the unit tests with coverage in GitHub Actions.
+
 ## 1.4.0
   * Exclude 403-forbidden streams from discovery instead of failing [#139](https://github.com/singer-io/tap-pendo/pull/139)
   * Add unit tests for discovery access checks.
