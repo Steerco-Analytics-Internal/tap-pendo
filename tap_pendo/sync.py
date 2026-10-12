@@ -71,6 +71,11 @@ def sync_stream(state, start_date, instance):
                                      instance.replication_key)
             singer.write_state(state)
 
+            # Stop paging the parent once its limited child has its records and the parent needs no more
+            if (instance.limited_child_is_done()
+                    and (max_records is None or is_limit_reached(counter.value, max_records))):
+                break
+
         return counter.value
 
 
@@ -80,6 +85,9 @@ def sync_full_table(state, instance):
     with metrics.record_counter(stream.tap_stream_id) as counter, Transformer(
             integer_datetime_fmt="unix-milliseconds-integer-datetime-parsing"
     ) as transformer:
+        # A stream limited to 0 records makes no request
+        if is_limit_reached(0, instance.max_records):
+            return counter.value
         # Get records for the stream
         (stream, records) = instance.sync(state)
         for record in records:

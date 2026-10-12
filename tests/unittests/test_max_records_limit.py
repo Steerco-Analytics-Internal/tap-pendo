@@ -8,7 +8,7 @@ from singer.utils import strptime_to_utc
 
 from tap_pendo import streams
 from tap_pendo.streams import (API_RECORD_LIMIT, MAX_RECORDS_LIMIT_KEY, FeatureEvents, Features,
-                               VisitorHistory, Visitors, get_max_records)
+                               VisitorHistory, Visitors, get_max_records, is_run_limited)
 from tap_pendo.sync import sync_full_table, sync_stream
 
 START_DATE = "2021-01-01T00:00:00Z"
@@ -55,6 +55,13 @@ class TestGetMaxRecords(unittest.TestCase):
     def test_json_string_map_is_parsed(self):
         self.assertEqual(get_max_records(make_config('{"features": 3}'), "features"), 3)
 
+    def test_json_null_and_non_object_mean_no_limits(self):
+        self.assertIsNone(get_max_records(make_config("null"), "features"))
+        self.assertIsNone(get_max_records(make_config("[]"), "features"))
+        self.assertIsNone(get_max_records(make_config("[1]"), "features"))
+        self.assertFalse(is_run_limited(make_config("null")))
+        self.assertFalse(is_run_limited(make_config("[]")))
+
     def test_negative_limit_raises(self):
         with self.assertRaises(ValueError):
             get_max_records(make_config({"features": -1}), "features")
@@ -69,6 +76,13 @@ class TestPageSize(unittest.TestCase):
 
     def test_configured_record_limit_below_max_records_wins(self):
         self.assertEqual(Features(make_config({"features": 25}, record_limit=10)).record_limit, 10)
+
+    def test_limited_visitors_request_a_page_of_at_least_1000(self):
+        self.assertEqual(Visitors(make_config({"visitors": 5})).record_limit, 1000)
+        self.assertEqual(Visitors(make_config({"visitors": 5}))
+                         .get_body()["request"]["pipeline"][-1]["limit"], 1000)
+        self.assertEqual(Visitors(make_config({"visitors": 5000})).record_limit, 5000)
+        self.assertEqual(Visitors(make_config({"visitors": 0})).record_limit, 1000)
 
     def test_unlimited_stream_keeps_default_page(self):
         self.assertEqual(Features(make_config()).record_limit, API_RECORD_LIMIT)
@@ -86,9 +100,17 @@ class TestBookmarks(unittest.TestCase):
         self.assertEqual(instance.get_bookmark(state, "features", START_DATE, "lastUpdatedAt"), START_DATE)
         self.assertEqual(state, {"bookmarks": {}})
 
+    def test_stream_absent_from_the_map_writes_no_bookmark_in_a_limited_run(self):
+        state = {"bookmarks": {}}
+        instance = FeatureEvents(make_config({"features": 1}))
+        instance.update_bookmark(state, "feature_events", START_DATE, "day")
+        instance.get_bookmark(state, "feature_events", START_DATE, "day")
+        instance.update_child_stream_bookmarks(state, instance, "feature-1", START_DATE, START_DATE)
+        self.assertEqual(state, {"bookmarks": {}})
+
     def test_unlimited_stream_writes_bookmark(self):
         state = {}
-        Features(make_config({"pages": 1})).update_bookmark(state, "features", START_DATE, "lastUpdatedAt")
+        Features(make_config()).update_bookmark(state, "features", START_DATE, "lastUpdatedAt")
         self.assertEqual(state["bookmarks"]["features"]["lastUpdatedAt"], START_DATE)
 
 
@@ -136,7 +158,7 @@ class TestIncrementalSync(unittest.TestCase):
     def test_unlimited_stream_syncs_everything_and_bookmarks(self, mock_request, mock_write_record, *_):
         mock_request.side_effect = [{"results": features(10)}, {"results": features(1, start=9)}]
         state = {}
-        count = sync_stream(state, START_DATE, self.build(make_config({"pages": 1})))
+        count = sync_stream(state, START_DATE, self.build(make_config()))
         self.assertEqual(count, 10)
         self.assertIn("features", state["bookmarks"])
 
@@ -176,6 +198,47 @@ class TestChildStreamLimit(unittest.TestCase):
         self.assertEqual(mock_write_record.call_count, 4)
         self.assertEqual(mock_child_sync.call_count, 2)
         self.assertEqual(state, {})
+
+    @mock.patch("tap_pendo.streams.FeatureEvents.sync")
+    def test_limited_parent_with_child_absent_from_the_map_keeps_state(self, mock_child_sync, mock_write_record, *_):
+        config = make_config({"features": 2})
+        FeatureEvents.stream = catalog_entry(FeatureEvents(config))
+        mock_child_sync.side_effect = lambda state, bookmark, key_id: ((None, feature_events(key_id, 3)), False)
+        parents = [{"id": f"feature-{i}", "last_updated_at": BASE_MS + i} for i in range(2)]
+        state = {"bookmarks": {"feature_events": {"last_processed": "feature-0"}}}
+        original_state = copy.deepcopy(state)
+
+        Features(config).sync_substream(state, Features(config), FeatureEvents(config), parents)
+
+        self.assertEqual(mock_write_record.call_count, 6)
+        self.assertEqual(state, original_state)
+
+    @mock.patch("tap_pendo.streams.FeatureEvents.sync")
+    def test_child_limit_holds_across_parent_pages(self, mock_child_sync, mock_write_record, *_):
+        config = make_config({"feature_events": 10})
+        FeatureEvents.stream = catalog_entry(FeatureEvents(config))
+        mock_child_sync.side_effect = lambda state, bookmark, key_id: ((None, feature_events(key_id, 2)), False)
+        parent = Features(config)
+        parent.stream = catalog_entry(parent)
+        pages = [features(2, start=i * 2) for i in range(5)]
+        calls = []
+
+        def parent_sync(state, bookmark):
+            index = len(calls)
+            calls.append(index)
+            parent.sync_substream(state, parent, FeatureEvents(config), pages[index])
+            return (parent.stream, pages[index]), index < len(pages) - 1
+
+        parent.sync = parent_sync
+        state = {"bookmarks": {"features": {"lastUpdatedAt": START_DATE}}}
+        original_state = copy.deepcopy(state)
+
+        sync_stream(state, START_DATE, parent)
+
+        child_writes = [c for c in mock_write_record.call_args_list if c[0][0] == "feature_events"]
+        self.assertEqual(len(child_writes), 10)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(state, original_state)
 
     @mock.patch("tap_pendo.streams.FeatureEvents.sync")
     def test_unlimited_child_reads_every_parent(self, mock_child_sync, mock_write_record, *_):
@@ -230,6 +293,13 @@ class TestFullTableSync(unittest.TestCase):
     def test_limited_full_table_stops_at_limit(self, mock_write_record):
         self.assertEqual(sync_full_table({}, FakeFullTableStream([{}, {}, {}], 2)), 2)
         self.assertEqual(mock_write_record.call_count, 2)
+
+    def test_zero_limit_full_table_makes_no_request(self, mock_write_record):
+        instance = FakeFullTableStream([{}], 0)
+        instance.sync = mock.Mock()
+        self.assertEqual(sync_full_table({}, instance), 0)
+        instance.sync.assert_not_called()
+        mock_write_record.assert_not_called()
 
     def test_unlimited_full_table_syncs_everything(self, mock_write_record):
         self.assertEqual(sync_full_table({}, FakeFullTableStream([{}, {}, {}], None)), 3)

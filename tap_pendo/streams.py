@@ -39,14 +39,28 @@ BACKOFF_FACTOR = 5
 MAX_RECORDS_LIMIT_KEY = "_hg_max_records_limit"
 
 
+def get_limit_map(config):
+    """
+        Return the {"<stream_id>": n} limit map, or an empty dict when there is none.
+        A JSON string that decodes to anything but an object counts as no map.
+    """
+    limits = (config or {}).get(MAX_RECORDS_LIMIT_KEY) or {}
+    if isinstance(limits, str):
+        limits = json.loads(limits)
+    return limits if isinstance(limits, dict) else {}
+
+
+def is_run_limited(config):
+    """A run with any limit is a sample, so no stream in it writes a bookmark."""
+    return bool(get_limit_map(config))
+
+
 def get_max_records(config, stream_name):
     """
         Return the record limit for the stream, or None when the stream runs unbounded.
         A limited stream stops after n records and writes no bookmarks.
     """
-    limits = (config or {}).get(MAX_RECORDS_LIMIT_KEY) or {}
-    if isinstance(limits, str):
-        limits = json.loads(limits)
+    limits = get_limit_map(config)
     if limits.get(stream_name) is None:
         return None
     max_records = int(limits[stream_name])
@@ -171,6 +185,8 @@ class Stream():
     request_retry_count = 1
     last_processed = None
     last_synced_record = {}
+    # Smallest page a limited run requests, for streams whose request has no bookmark filter
+    limited_page_floor = 0
 
     # initialized the endpoint attribute which can be overriden by child streams based on
     # the different parameters used by the stream.
@@ -179,6 +195,8 @@ class Stream():
     def __init__(self, config=None):
         self.config = config
         self.max_records = get_max_records(config, self.name)
+        # Records each limited child has emitted across the parent's pages, for this run
+        self.child_record_counts = {}
         self.record_limit = self.get_default_record_limit()
         self.empty_replication_key_records = []
 
@@ -202,7 +220,7 @@ class Stream():
         # A limited stream never needs a page larger than the records it emits
         max_records = getattr(self, 'max_records', None)
         if max_records is not None:
-            page_limit = min(page_limit, max(max_records, 1))
+            page_limit = max(min(page_limit, max(max_records, 1)), self.limited_page_floor)
         return page_limit
 
     def send_request_get_results(self, req, endpoint, params, count, **kwargs):
@@ -282,7 +300,7 @@ class Stream():
         if (state is None) or ('bookmarks' not in state):
             return default
         # Initialize bookmark if not present. A limited stream leaves the state untouched.
-        if not state.get('bookmarks').get(stream) and get_max_records(self.config, stream) is None:
+        if not state.get('bookmarks').get(stream) and not is_run_limited(self.config):
             state['bookmarks'][stream] = {}
         # Look for bookmark with key for stream
         if key:
@@ -299,7 +317,7 @@ class Stream():
         # recent thing it saw the next time you run, because the querying
         # only allows greater than or equal semantics.
         # A limited stream is a sample, so it never moves its bookmark.
-        if get_max_records(self.config, stream) is not None:
+        if is_run_limited(self.config):
             return
         singer.write_bookmark(
             state,
@@ -428,6 +446,15 @@ class Stream():
     def is_selected(self):
         return self.stream is not None
 
+    def limited_child_is_done(self):
+        """True once the selected child has a limit and has emitted that many records"""
+        sub_stream_class = STREAMS.get(SUB_STREAMS.get(self.name))
+        if not sub_stream_class or sub_stream_class.stream is None:
+            return False
+        child_max_records = get_max_records(self.config, sub_stream_class.name)
+        return child_max_records is not None and is_limit_reached(
+            self.child_record_counts.get(sub_stream_class.name, 0), child_max_records)
+
     def transform(self, record):
         return humps.decamelize(record)
 
@@ -477,7 +504,7 @@ class Stream():
         last_processed_key = parent.key_properties[0] if isinstance(parent, Visitors) else humps.decamelize(self.replication_key)
         # A limited child stream stops reading parents once it has emitted its records
         child_max_records = get_max_records(self.config, sub_stream.name)
-        child_record_count = 0
+        child_record_count = self.child_record_counts.get(sub_stream.name, 0)
         # Loop over records of parent stream
         for record in parent_response:
             if is_limit_reached(child_record_count, child_max_records):
@@ -583,6 +610,7 @@ class Stream():
 
                                 counter.increment()
                                 child_record_count += 1
+                                self.child_record_counts[sub_stream.name] = child_record_count
                                 singer.write_record(sub_stream.stream.tap_stream_id,
                                                     transformed_record)
 
@@ -601,7 +629,7 @@ class Stream():
                     sub_stream.name, record[last_processed_key])
 
         # After processing for all parent ids we can remove our resumption state
-        if child_max_records is None and 'last_processed' in state.get('bookmarks').get(sub_stream.name):
+        if not is_run_limited(self.config) and 'last_processed' in state.get('bookmarks').get(sub_stream.name):
             state.get('bookmarks').get(sub_stream.name).pop('last_processed')
 
         self.update_child_stream_bookmarks(state=state,
@@ -785,6 +813,9 @@ class Stream():
 
 
 class LazyAggregationStream(Stream):
+    # Visitors pages by visitor id with no time filter, so a tiny page only adds requests
+    limited_page_floor = 1000
+
     def send_request_get_results(self, req, endpoint, params, count, **kwargs):
         # Set request timeout to config param `request_timeout` value.
         # If value is 0,"0", "" or None then it will set default to default to 300.0 seconds if not passed in config.
