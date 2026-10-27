@@ -1,9 +1,9 @@
 import unittest
 from unittest import mock
-from singer import utils, metadata
+from singer import Transformer, utils, metadata
 from singer.utils import strptime_to_utc, strftime
-from tap_pendo.discover import LOGGER, build_metadata_metadata, discover_streams, get_schema_property_type
-from tap_pendo.streams import Stream
+from tap_pendo.discover import LOGGER, build_account_visitor_metadata, build_metadata_metadata, discover_streams, get_schema_property_type
+from tap_pendo.streams import STREAMS, Stream
 
 
 class TestCustomFields(unittest.TestCase):
@@ -307,9 +307,57 @@ class TestCustomFields(unittest.TestCase):
         schema_types = ['string', 'time', 'boolean', 'integer', 'float']
 
         expected_property_types = {'boolean': {'type': ['null', 'boolean']},
-                                   'float': {'type': ['null', 'number']},
+                                   'float': {'type': ['null', 'string']},
                                    'integer': {'type': ['null', 'integer', 'number', 'string']},
                                    'string': {'type': ['null', 'string']},
-                                   'time': {'format': 'date-time', 'type': ['null', 'string']}}
+                                   'time': {'type': ['null', 'string']}}
         actual_property_types = {schema_type: get_schema_property_type(schema_type) for schema_type in schema_types}
         self.assertEqual(actual_property_types, expected_property_types)
+
+    def test_tolerant_types_never_include_boolean(self):
+        """Hotglue's target-parquet fails on a catch-all type that includes boolean."""
+        for schema_type in ['time', 'integer', 'float']:
+            self.assertNotIn('boolean', get_schema_property_type(schema_type)['type'])
+
+    def test_float_and_time_are_text_only(self):
+        """A column that mixes numbers and text fails the Parquet write, so these stay text."""
+        for schema_type in ['time', 'float']:
+            self.assertEqual(get_schema_property_type(schema_type)['type'], ['null', 'string'])
+
+    def test_transform_accepts_dirty_float_and_time_custom_fields(self):
+        """
+        Pendo returns blank, quoted and malformed values for float and time custom fields.
+        The transformer must accept each value instead of failing the whole stream.
+        """
+        custom_account_fields = {
+            "sfnpslatest": {"type": "float"},
+            "sfpendogolivedate": {"type": "time"},
+        }
+        schema = STREAMS['accounts']({}).load_schema()
+        build_account_visitor_metadata({}, schema, custom_account_fields)
+
+        # Each pair is a raw value and the value the transformer should emit.
+        float_values = [
+            (7.75, "7.75"),
+            (8, "8"),
+            ("", ""),
+            ('""', '""'),
+            (None, None),
+        ]
+        time_values = [
+            ("0000-12-31 19:03:58", "0000-12-31 19:03:58"),
+            ("", ""),
+            (1669334400000, "1669334400000"),
+            ("8/1/24 20:00", "8/1/24 20:00"),
+            (None, None),
+        ]
+        cases = [("sfnpslatest", raw, expected) for raw, expected in float_values]
+        cases += [("sfpendogolivedate", raw, expected) for raw, expected in time_values]
+
+        # sync.py builds its Transformer with this integer datetime format.
+        with Transformer(integer_datetime_fmt="unix-milliseconds-integer-datetime-parsing") as transformer:
+            for field, raw, expected in cases:
+                with self.subTest(field=field, value=raw):
+                    record = {"account_id": "a1", "metadata_custom": {field: raw}}
+                    transformed = transformer.transform(record, schema)
+                    self.assertEqual(transformed["metadata_custom"][field], expected)
