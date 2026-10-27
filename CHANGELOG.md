@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1 (Steerco fork)
+  * Accept blank, quoted and malformed values in custom `float` and `time` fields. One bad value no longer fails the `accounts` or `visitors` stream.
+  * Custom `time` fields keep the value Pendo returns instead of converting it to a date-time.
+
 ## 1.5.0 (Steerco fork)
   * Accept `api_key` as an alias of `x_pendo_integration_key`.
   * Default `start_date` to 90 days before the run, `period` to `dayRange` and `lookback_window` to 2 days.

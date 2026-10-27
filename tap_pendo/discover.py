@@ -55,13 +55,17 @@ def get_schema_property_type(schema_type):
     if schema_type == 'string':
         return {"type": ["null", "string"]}
     elif schema_type == 'time':
-        return {"type": ["null", "string"], "format": "date-time"}
+        # Pendo returns blanks, epoch milliseconds and malformed dates here,
+        # so take the value as is instead of parsing it as a date-time.
+        return {"type": ["null", "integer", "number", "string"]}
     elif schema_type == 'boolean':
         return {"type": ["null", "boolean"]}
     elif schema_type == 'integer':
         return {"type": ["null", "integer", "number", "string"]}
     elif schema_type == 'float':
-        return {"type": ["null", "number"]}
+        # Pendo returns blanks and quoted strings here. Number comes before
+        # integer so the transformer never truncates a decimal.
+        return {"type": ["null", "number", "integer", "string"]}
     elif schema_type == '':
         return {}
 
