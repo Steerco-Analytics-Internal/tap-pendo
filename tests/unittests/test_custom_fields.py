@@ -307,10 +307,10 @@ class TestCustomFields(unittest.TestCase):
         schema_types = ['string', 'time', 'boolean', 'integer', 'float']
 
         expected_property_types = {'boolean': {'type': ['null', 'boolean']},
-                                   'float': {'type': ['null', 'number', 'integer', 'string']},
+                                   'float': {'type': ['null', 'string']},
                                    'integer': {'type': ['null', 'integer', 'number', 'string']},
                                    'string': {'type': ['null', 'string']},
-                                   'time': {'type': ['null', 'integer', 'number', 'string']}}
+                                   'time': {'type': ['null', 'string']}}
         actual_property_types = {schema_type: get_schema_property_type(schema_type) for schema_type in schema_types}
         self.assertEqual(actual_property_types, expected_property_types)
 
@@ -318,6 +318,11 @@ class TestCustomFields(unittest.TestCase):
         """Hotglue's target-parquet fails on a catch-all type that includes boolean."""
         for schema_type in ['time', 'integer', 'float']:
             self.assertNotIn('boolean', get_schema_property_type(schema_type)['type'])
+
+    def test_float_and_time_are_text_only(self):
+        """A column that mixes numbers and text fails the Parquet write, so these stay text."""
+        for schema_type in ['time', 'float']:
+            self.assertEqual(get_schema_property_type(schema_type)['type'], ['null', 'string'])
 
     def test_transform_accepts_dirty_float_and_time_custom_fields(self):
         """
@@ -333,8 +338,8 @@ class TestCustomFields(unittest.TestCase):
 
         # Each pair is a raw value and the value the transformer should emit.
         float_values = [
-            (7.75, 7.75),
-            (8, 8.0),
+            (7.75, "7.75"),
+            (8, "8"),
             ("", ""),
             ('""', '""'),
             (None, None),
@@ -342,7 +347,7 @@ class TestCustomFields(unittest.TestCase):
         time_values = [
             ("0000-12-31 19:03:58", "0000-12-31 19:03:58"),
             ("", ""),
-            (1669334400000, 1669334400000),
+            (1669334400000, "1669334400000"),
             ("8/1/24 20:00", "8/1/24 20:00"),
             (None, None),
         ]

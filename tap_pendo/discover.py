@@ -55,17 +55,16 @@ def get_schema_property_type(schema_type):
     if schema_type == 'string':
         return {"type": ["null", "string"]}
     elif schema_type == 'time':
-        # Pendo returns blanks, epoch milliseconds and malformed dates here,
-        # so take the value as is instead of parsing it as a date-time.
-        return {"type": ["null", "integer", "number", "string"]}
+        # Pendo returns blanks, epoch milliseconds and malformed dates here.
+        # Text only: a column that mixes numbers and text fails the Parquet write.
+        return {"type": ["null", "string"]}
     elif schema_type == 'boolean':
         return {"type": ["null", "boolean"]}
     elif schema_type == 'integer':
         return {"type": ["null", "integer", "number", "string"]}
     elif schema_type == 'float':
-        # Pendo returns blanks and quoted strings here. Number comes before
-        # integer so the transformer never truncates a decimal.
-        return {"type": ["null", "number", "integer", "string"]}
+        # Pendo returns blanks and quoted strings here. Text only, as for time.
+        return {"type": ["null", "string"]}
     elif schema_type == '':
         return {}
 
